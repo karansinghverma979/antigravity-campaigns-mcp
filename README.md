@@ -202,6 +202,15 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/App
 
 ---
 
+## 🧠 Official Companion Skill & Autonomous Governance
+
+This MCP server is natively governed and orchestrated by the **[`campaigns`](https://github.com/karansinghverma979/antigravity-custom-skills/blob/main/campaigns/SKILL.md)** skill from the **[`antigravity-custom-skills`](https://github.com/karansinghverma979/antigravity-custom-skills)** suite.
+
+- 📖 **Skill Specification**: [`campaigns/SKILL.md`](https://github.com/karansinghverma979/antigravity-custom-skills/blob/main/campaigns/SKILL.md)
+- 🌐 **Master Skillpack Suite**: [Antigravity Custom Skills](https://github.com/karansinghverma979/antigravity-custom-skills)
+
+---
+
 <div align="center">
 
 ### ⭐ Star this repository if you run AI-driven tactical operations!
