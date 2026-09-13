@@ -1,0 +1,23 @@
+# SQLite Databases & Dynamic State (NEVER COMMIT)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
+*.bak
+campaigns.sqlite
+
+# Python Bytecode & Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+ENV/
+
+# System & OS Files
+.DS_Store
+Thumbs.db
+*.log
