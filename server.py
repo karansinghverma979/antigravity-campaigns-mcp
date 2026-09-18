@@ -161,11 +161,15 @@ def sanitize_tag_name(tag):
 def parse_date_obj(date_str):
     if not date_str:
         return None
-    parts = str(date_str).strip().split("-")
+    clean = str(date_str).strip().replace("/", "-").replace(".", "-")
+    parts = clean.split("-")
     if len(parts) != 3:
         return None
     try:
-        d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
+        if len(parts[0]) == 4:  # YYYY-MM-DD
+            y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+        else:  # DD-MM-YYYY
+            d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
         return datetime.date(y, m, d)
     except Exception:
         return None
@@ -303,55 +307,42 @@ def validate_minister(assigned):
 def normalize_and_validate_strike_status(status):
     if not status:
         return "Standby"
-    s_clean = str(status).strip().capitalize()
-    alias_map = {
-        "Completed": "Neutralized",
-        "Done": "Neutralized",
-        "Victory": "Neutralized",
-        "Neutralize": "Neutralized",
-        "Finish": "Neutralized",
-        "Finished": "Neutralized",
-        "Cancel": "Aborted",
-        "Cancelled": "Aborted",
-        "Failed": "Aborted",
-        "Abort": "Aborted",
-        "Doing": "Engaged",
-        "Active": "Engaged",
-        "Progress": "Engaged",
-        "Plan": "Standby",
-        "Todo": "Standby",
-        "Holding": "Undated",
-        "Holdingbay": "Undated",
-        "Blueprint": "Template"
-    }
-    resolved = alias_map.get(s_clean, s_clean)
-    if resolved not in VALID_STRIKE_STATUSES:
-        raise ValueError(f"Invalid strike status '{status}'. Allowed values: {VALID_STRIKE_STATUSES}")
-    return resolved
+    s = str(status).strip().lower().replace("_", " ")
+    if any(w in s for w in ["neutral", "complete", "done", "victory", "finish"]):
+        return "Neutralized"
+    if any(w in s for w in ["abort", "cancel", "fail", "drop", "abandon"]):
+        return "Aborted"
+    if any(w in s for w in ["engag", "doing", "active", "progress"]):
+        return "Engaged"
+    if any(w in s for w in ["standby", "todo", "plan", "ready"]):
+        return "Standby"
+    if any(w in s for w in ["undated", "holding"]):
+        return "Undated"
+    if any(w in s for w in ["template", "blueprint"]):
+        return "Template"
+    if any(w in s for w in ["pend"]):
+        return "Pending"
+    for valid in VALID_STRIKE_STATUSES:
+        if valid.lower() == s:
+            return valid
+    raise ValueError(f"Invalid strike status '{status}'. Allowed values: {VALID_STRIKE_STATUSES}")
 
 def normalize_and_validate_subtask_status(status):
     if not status:
         return "Initiated"
-    s_clean = str(status).strip().capitalize()
-    alias_map = {
-        "Done": "Completed",
-        "Finish": "Completed",
-        "Finished": "Completed",
-        "Neutralized": "Completed",
-        "Active": "Doing",
-        "Progress": "Doing",
-        "In_progress": "Doing",
-        "Aborted": "Failed",
-        "Cancelled": "Failed",
-        "Abandoned": "Failed",
-        "Todo": "Initiated",
-        "Plan": "Initiated",
-        "Planned": "Initiated"
-    }
-    resolved = alias_map.get(s_clean, s_clean)
-    if resolved not in VALID_SUBTASK_STATUSES:
-        raise ValueError(f"Invalid subtask status '{status}'. Allowed values: {VALID_SUBTASK_STATUSES}")
-    return resolved
+    s = str(status).strip().lower().replace("_", " ")
+    if any(w in s for w in ["complete", "done", "finish", "neutral"]):
+        return "Completed"
+    if any(w in s for w in ["doing", "progress", "active", "work"]):
+        return "Doing"
+    if any(w in s for w in ["fail", "abort", "cancel", "abandon"]):
+        return "Failed"
+    if any(w in s for w in ["init", "todo", "plan", "start"]):
+        return "Initiated"
+    for valid in VALID_SUBTASK_STATUSES:
+        if valid.lower() == s:
+            return valid
+    raise ValueError(f"Invalid subtask status '{status}'. Allowed values: {VALID_SUBTASK_STATUSES}")
 
 def normalize_and_validate_priority(priority):
     if not priority:
@@ -420,11 +411,20 @@ def normalize_and_validate_treasury_state(state):
         return st.capitalize()
     raise ValueError(f"Invalid treasury state '{state}'. Allowed closed enum: {VALID_TREASURY_STATES}")
 
-def normalize_and_validate_treasury_status(status, state="Open"):
-    norm_state = normalize_and_validate_treasury_state(state)
+def normalize_and_validate_treasury_status(status, state=None):
     if not status:
+        norm_state = normalize_and_validate_treasury_state(state) if state else "Open"
         return "Paid" if norm_state == "Closed" else "In Progress"
     clean = str(status).strip().lower()
+
+    # If state is omitted, infer state from status keyword
+    if not state:
+        if any(w in clean for w in ["default", "betray", "bad debt", "loss", "denied", "settle", "haircut", "barter", "compromise", "paid", "complete", "cleared", "full"]):
+            state = "Closed"
+        else:
+            state = "Open"
+
+    norm_state = normalize_and_validate_treasury_state(state)
     if norm_state == "Closed":
         if any(w in clean for w in ["default", "betray", "bad debt", "loss", "denied"]):
             return "Defaulted"
@@ -489,31 +489,36 @@ def normalize_and_validate_activity(activity):
 
 def extract_smart_tokens(title, execution_date=None, assigned=None):
     clean_title = sanitize_text(title, "title", required=True)
-    
+
     # Extract #Minister
     for m in ["Adhipati", "Bhakta", "Antaryami", "Jigyasu", "Shava"]:
         match = re.search(r"#" + m + r"\b", clean_title, re.IGNORECASE)
         if match:
-            assigned = m.capitalize()
+            if not assigned:
+                assigned = m.capitalize()
             clean_title = re.sub(r"#" + m + r"\b", "", clean_title, flags=re.IGNORECASE).strip()
             break
 
     # Extract relative date keywords (@today, @tomorrow, @+Nd)
     now = datetime.datetime.now()
     if re.search(r"@(tomorrow|tom|tmrw)\b", clean_title, re.IGNORECASE):
-        execution_date = (now + datetime.timedelta(days=1)).strftime("%d-%m-%Y")
+        if not execution_date:
+            execution_date = (now + datetime.timedelta(days=1)).strftime("%d-%m-%Y")
         clean_title = re.sub(r"@(tomorrow|tom|tmrw)\b", "", clean_title, flags=re.IGNORECASE).strip()
     elif re.search(r"@(overmorrow|over|ovm)\b", clean_title, re.IGNORECASE):
-        execution_date = (now + datetime.timedelta(days=2)).strftime("%d-%m-%Y")
+        if not execution_date:
+            execution_date = (now + datetime.timedelta(days=2)).strftime("%d-%m-%Y")
         clean_title = re.sub(r"@(overmorrow|over|ovm)\b", "", clean_title, flags=re.IGNORECASE).strip()
     elif re.search(r"@(today|tod)\b", clean_title, re.IGNORECASE):
-        execution_date = now.strftime("%d-%m-%Y")
+        if not execution_date:
+            execution_date = now.strftime("%d-%m-%Y")
         clean_title = re.sub(r"@(today|tod)\b", "", clean_title, flags=re.IGNORECASE).strip()
     else:
         offset_match = re.search(r"@\+(\d+)(?:d|days)?\b", clean_title, re.IGNORECASE)
         if offset_match:
-            days = int(offset_match.group(1))
-            execution_date = (now + datetime.timedelta(days=days)).strftime("%d-%m-%Y")
+            if not execution_date:
+                days = int(offset_match.group(1))
+                execution_date = (now + datetime.timedelta(days=days)).strftime("%d-%m-%Y")
             clean_title = re.sub(r"@\+\d+(?:d|days)?\b", "", clean_title, flags=re.IGNORECASE).strip()
 
     clean_title = re.sub(r"\s+", " ", clean_title).strip()
@@ -543,14 +548,14 @@ def handle_get_dashboard(args):
                       (SELECT COUNT(*) FROM Subtasks WHERE task_id = t.id AND status = 'Completed') as subtask_done_count
                FROM Tasks t
                WHERE t.state = 'Execution'
-               ORDER BY t.priority DESC, t.id ASC"""
+               ORDER BY CASE t.priority WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 WHEN 'Low' THEN 3 ELSE 4 END ASC, t.id ASC"""
         ).fetchall()
 
         imminent_deadlines = conn.execute(
             """SELECT id, title, state, stage, deadline, priority
                FROM Tasks
                WHERE state IN ('Execution', 'Arsenal') AND deadline IS NOT NULL AND deadline != ''
-               ORDER BY deadline ASC LIMIT 10"""
+               ORDER BY (substr(deadline, 7, 4) || '-' || substr(deadline, 4, 2) || '-' || substr(deadline, 1, 2)) ASC LIMIT 10"""
         ).fetchall()
 
         strikes_by_minister = {m: [] for m in VALID_MINISTERS}
@@ -630,9 +635,8 @@ def handle_get_task_details(args):
     task_id = sanitize_integer(args.get("task_id"), "task_id", required=True)
 
     with get_db() as conn:
+        verify_task_exists(conn, task_id)
         task = conn.execute("SELECT * FROM Tasks WHERE id = ?", (task_id,)).fetchone()
-        if not task:
-            return {"error": f"Task with ID {task_id} not found."}
 
         tags = conn.execute("SELECT * FROM Tags WHERE task_id = ?", (task_id,)).fetchall()
         subtasks = conn.execute("SELECT * FROM Subtasks WHERE task_id = ? ORDER BY id ASC", (task_id,)).fetchall()
@@ -719,7 +723,8 @@ def handle_create_task(args):
         )
         task_id = cur.lastrowid
 
-        for t in tags:
+        unique_tags = list(dict.fromkeys(tags))
+        for t in unique_tags:
             conn.execute("INSERT INTO Tags (task_id, tag_name) VALUES (?, ?)", (task_id, t))
 
         subtasks_created = []
@@ -784,8 +789,22 @@ def handle_update_task(args):
 
         merged_state = fields.get("state", curr["state"])
         merged_stage = fields.get("stage", curr["stage"])
+
+        # Smart transition: If state changed without stage, default stage to target state's first stage
+        if "state" in fields and "stage" not in fields:
+            state_clean = str(fields["state"]).strip().capitalize()
+            if state_clean in VALID_STATE_STAGES:
+                merged_stage = VALID_STATE_STAGES[state_clean][0]
+        # Smart transition: If stage changed without state, infer state
+        elif "stage" in fields and "state" not in fields:
+            stg_lower = str(fields["stage"]).strip().lower()
+            for st, stgs in VALID_STATE_STAGES.items():
+                if any(s.lower() == stg_lower for s in stgs):
+                    merged_state = st
+                    break
+
         valid_state, valid_stage = normalize_and_validate_task_state_stage(merged_state, merged_stage)
-        if "state" in fields or "stage" in fields:
+        if "state" in fields or "stage" in fields or valid_state != curr["state"]:
             fields["state"] = valid_state
             fields["stage"] = valid_stage
 
@@ -815,7 +834,7 @@ def handle_update_task(args):
         if merged_initiated and dt_origin:
             dt_init = parse_date_obj(merged_initiated)
             if dt_init < dt_origin:
-                raise ValueError(f"Chronological Error: 'initiated_at' ({merged_initiated}) cannot be earlier than 'origin_date' ({origin_date}).")
+                raise ValueError(f"Chronological Error: 'initiated_at' ({merged_initiated}) cannot be earlier than 'origin_date' ({merged_origin}).")
 
         if merged_deadline:
             dt_dl = parse_date_obj(merged_deadline)
@@ -827,7 +846,7 @@ def handle_update_task(args):
         if merged_ended and dt_origin:
             dt_end = parse_date_obj(merged_ended)
             if dt_end < dt_origin:
-                raise ValueError(f"Chronological Error: 'ended_date' ({merged_ended}) cannot be earlier than 'origin_date' ({origin_date}).")
+                raise ValueError(f"Chronological Error: 'ended_date' ({merged_ended}) cannot be earlier than 'origin_date' ({merged_origin}).")
 
         if "deadline" in fields and curr["deadline"] and fields["deadline"] != curr["deadline"]:
             if "reschedule_count" not in fields:
@@ -878,12 +897,20 @@ def handle_delete_task(args):
 
 def handle_list_strikes(args):
     execution_date_raw = args.get("execution_date")
-    if str(execution_date_raw).lower() in ["today", "@today"]:
-        execution_date = get_today_str()
-    elif str(execution_date_raw).lower() in ["tomorrow", "@tomorrow"]:
-        execution_date = (datetime.datetime.now() + datetime.timedelta(days=1)).strftime("%d-%m-%Y")
+    if execution_date_raw is not None:
+        raw_lower = str(execution_date_raw).strip().lower()
+        if raw_lower in ["today", "@today"]:
+            execution_date = get_today_str()
+        elif raw_lower in ["tomorrow", "@tomorrow", "tom", "tmrw"]:
+            execution_date = (datetime.datetime.now() + datetime.timedelta(days=1)).strftime("%d-%m-%Y")
+        elif raw_lower in ["yesterday", "@yesterday", "yest"]:
+            execution_date = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%d-%m-%Y")
+        elif raw_lower in ["undated", "holding", "none", ""]:
+            execution_date = ""
+        else:
+            execution_date = sanitize_date(execution_date_raw, "execution_date")
     else:
-        execution_date = sanitize_date(execution_date_raw, "execution_date")
+        execution_date = None
 
     assigned = args.get("assigned")
     status = args.get("status")
@@ -940,10 +967,14 @@ def handle_create_strike(args):
         assigned=args.get("assigned")
     )
 
-    execution_date = sanitize_date(execution_date, "execution_date") or get_today_str()
+    status = normalize_and_validate_strike_status(args.get("status", "Standby"))
+    if status == "Undated" or args.get("execution_date") == "" or str(args.get("execution_date", "")).lower() in ["undated", "holding"]:
+        execution_date = ""
+    else:
+        execution_date = sanitize_date(execution_date, "execution_date") or get_today_str()
+
     assigned = validate_minister(assigned)
     created_at = sanitize_date(args.get("created_at"), "created_at") or get_today_str()
-    status = normalize_and_validate_strike_status(args.get("status", "Standby"))
     notes = sanitize_text(args.get("notes"), "notes", max_len=10000)
     task_id = sanitize_integer(args.get("task_id"), "task_id")
     task_title = sanitize_text(args.get("task_title") or args.get("task_name"), "task_title")
@@ -1009,6 +1040,9 @@ def handle_update_strike(args):
     if not fields:
         raise ValueError("Security Error: 'fields' or top-level column values must be provided.")
 
+    if fields.get("status") == "Undated" and "execution_date" not in fields:
+        fields["execution_date"] = ""
+
     with get_db() as conn:
         verify_strike_exists(conn, strike_id)
 
@@ -1019,7 +1053,10 @@ def handle_update_strike(args):
                 if col == "assigned":
                     val = validate_minister(val)
                 elif col == "execution_date":
-                    val = sanitize_date(val, col)
+                    if val == "" or str(val).lower() in ["undated", "holding"]:
+                        val = ""
+                    else:
+                        val = sanitize_date(val, col)
                 elif col == "status":
                     val = normalize_and_validate_strike_status(val)
                 elif col in ["task_id", "subtask_id"]:
@@ -1073,23 +1110,27 @@ def handle_manage_subtask(args):
         elif action == "update":
             subtask_id = sanitize_integer(args.get("subtask_id"), "subtask_id", required=True)
             verify_subtask_exists(conn, subtask_id)
+            fields = args.get("fields", {})
+            if not isinstance(fields, dict):
+                fields = {}
+            merged = {**fields, **{k: v for k, v in args.items() if k not in ["action", "subtask_id", "fields"]}}
             updates = []
             params = []
-            if "title" in args:
+            if "title" in merged:
                 updates.append("title = ?")
-                params.append(sanitize_text(args["title"], "title", required=True))
-            if "status" in args:
+                params.append(sanitize_text(merged["title"], "title", required=True))
+            if "status" in merged:
                 updates.append("status = ?")
-                params.append(normalize_and_validate_subtask_status(args["status"]))
-            if "created_at" in args:
+                params.append(normalize_and_validate_subtask_status(merged["status"]))
+            if "created_at" in merged:
                 updates.append("created_at = ?")
-                params.append(sanitize_date(args["created_at"], "created_at"))
+                params.append(sanitize_date(merged["created_at"], "created_at"))
             if not updates:
                 raise ValueError("title, status, or created_at required to update subtask")
             params.append(subtask_id)
             conn.execute(f"UPDATE Subtasks SET {', '.join(updates)} WHERE id = ?", params)
             conn.commit()
-            return {"success": True, "subtask_id": subtask_id}
+            return {"success": True, "subtask_id": subtask_id, "updated_fields": list(merged.keys())}
 
         elif action == "delete":
             subtask_id = sanitize_integer(args.get("subtask_id"), "subtask_id", required=True)
@@ -1116,6 +1157,12 @@ def handle_manage_tag(args):
             if task_id:
                 verify_task_exists(conn, task_id)
             tag_name = sanitize_tag_name(args.get("tag_name"))
+            if task_id:
+                existing = conn.execute("SELECT id FROM Tags WHERE task_id = ? AND tag_name = ?", (task_id, tag_name)).fetchone()
+            else:
+                existing = conn.execute("SELECT id FROM Tags WHERE task_id IS NULL AND tag_name = ?", (tag_name,)).fetchone()
+            if existing:
+                return {"success": True, "tag_id": existing["id"], "task_id": task_id, "tag_name": tag_name, "message": "Tag already associated."}
             cur = conn.execute("INSERT INTO Tags (task_id, tag_name) VALUES (?, ?)", (task_id, tag_name))
             conn.commit()
             return {"success": True, "tag_id": cur.lastrowid, "task_id": task_id, "tag_name": tag_name}
@@ -1283,7 +1330,7 @@ def handle_list_treasury(args):
         params.append(normalize_and_validate_treasury_state(state))
     if status:
         query += " AND t.status = ?"
-        params.append(normalize_and_validate_treasury_status(status, state or "Open"))
+        params.append(normalize_and_validate_treasury_status(status, state))
     if category:
         query += " AND t.category = ?"
         params.append(normalize_and_validate_treasury_category(category))
@@ -1317,7 +1364,7 @@ def handle_manage_treasury(args):
             counterparty_name = sanitize_text(args.get("counterparty_name"), "counterparty_name")
             
             if not counterparty_id and counterparty_name:
-                existing_cp = conn.execute("SELECT id FROM Counterparties WHERE name = ?", (counterparty_name,)).fetchone()
+                existing_cp = conn.execute("SELECT id FROM Counterparties WHERE name = ? COLLATE NOCASE", (counterparty_name,)).fetchone()
                 if existing_cp:
                     counterparty_id = existing_cp["id"]
                 else:
@@ -1336,12 +1383,33 @@ def handle_manage_treasury(args):
             category = normalize_and_validate_treasury_category(args.get("category", "Borrowed"))
             amount = sanitize_float(args.get("amount"), "amount", required=True, allow_zero=False)
             paid_amount = sanitize_float(args.get("paid_amount", 0.0), "paid_amount", allow_zero=True)
+            if paid_amount > amount:
+                raise ValueError(f"Financial Error: 'paid_amount' ({paid_amount}) cannot exceed committed obligation 'amount' ({amount}).")
             priority = normalize_and_validate_priority(args.get("priority", "Medium"))
-            state = normalize_and_validate_treasury_state(args.get("state", "Open"))
-            if args.get("status"):
-                status = normalize_and_validate_treasury_status(args.get("status"), state)
+
+            state_arg = args.get("state")
+            status_arg = args.get("status")
+            if state_arg is None:
+                if status_arg:
+                    status = normalize_and_validate_treasury_status(status_arg)
+                    state = "Closed" if status in VALID_STATUSES_BY_STATE["Closed"] else "Open"
+                else:
+                    if paid_amount >= amount:
+                        state = "Closed"
+                        status = "Paid"
+                    elif paid_amount > 0:
+                        state = "Open"
+                        status = "Partially Paid"
+                    else:
+                        state = "Open"
+                        status = "In Progress"
             else:
-                status = "Paid" if state == "Closed" else ("Partially Paid" if paid_amount > 0 else "In Progress")
+                state = normalize_and_validate_treasury_state(state_arg)
+                if status_arg:
+                    status = normalize_and_validate_treasury_status(status_arg, state)
+                else:
+                    status = "Paid" if state == "Closed" else ("Partially Paid" if paid_amount > 0 else "In Progress")
+
             opened_at = sanitize_date(args.get("opened_at"), "opened_at") or get_today_str()
             opened_mode = normalize_and_validate_payment_mode(args.get("opened_mode", "UPI"))
             opened_reference = sanitize_text(args.get("opened_reference"), "opened_reference")
@@ -1349,6 +1417,8 @@ def handle_manage_treasury(args):
             promise_date = sanitize_date(args.get("promise_date"), "promise_date")
             expected_date = sanitize_date(args.get("expected_date"), "expected_date")
             closed_at = sanitize_date(args.get("closed_at"), "closed_at")
+            if state == "Closed" and not closed_at:
+                closed_at = get_today_str()
             closed_mode = normalize_and_validate_payment_mode(args.get("closed_mode")) if args.get("closed_mode") else None
             closed_reference = sanitize_text(args.get("closed_reference"), "closed_reference")
             closed_note = sanitize_text(args.get("closed_note"), "closed_note")
@@ -1401,6 +1471,29 @@ def handle_manage_treasury(args):
             if "state" in fields:
                 fields["state"] = normalize_and_validate_treasury_state(fields["state"])
                 target_state = fields["state"]
+            elif "status" in fields:
+                status_raw = str(fields["status"]).strip().lower()
+                if any(w in status_raw for w in ["default", "betray", "bad debt", "loss", "denied", "settle", "haircut", "barter", "compromise", "paid", "complete", "cleared", "full"]):
+                    target_state = "Closed"
+                    fields["state"] = "Closed"
+                elif any(w in status_raw for w in ["partially", "partial", "pending", "overdue", "delayed", "dispute", "conflict", "hold", "in progress", "progress", "active", "doing"]):
+                    target_state = "Open"
+                    fields["state"] = "Open"
+
+            # Auto-stamp closed_at when transitioning to Closed
+            if target_state == "Closed" and "closed_at" not in fields and not curr["closed_at"]:
+                fields["closed_at"] = get_today_str()
+
+            # If marked Paid without passing paid_amount, auto-complete paid_amount to amount
+            if fields.get("status") in ["Paid", "paid"] and "paid_amount" not in fields:
+                effective_amount = fields.get("amount", curr["amount"])
+                fields["paid_amount"] = effective_amount
+
+            # Validate paid_amount <= amount if either is updated
+            merged_amount = fields.get("amount", curr["amount"])
+            merged_paid = fields.get("paid_amount", curr["paid_amount"])
+            if merged_paid is not None and merged_amount is not None and float(merged_paid) > float(merged_amount):
+                raise ValueError(f"Financial Error: 'paid_amount' ({merged_paid}) cannot exceed committed obligation 'amount' ({merged_amount}).")
 
             updates = []
             params = []
@@ -1450,7 +1543,9 @@ def handle_manage_treasury(args):
             payment_amount = sanitize_float(args.get("payment_amount"), "payment_amount", required=True, allow_zero=False)
             curr_paid = float(t_curr["paid_amount"] or 0.0)
             total_amount = float(t_curr["amount"] or 0.0)
-            new_paid = curr_paid + payment_amount
+            new_paid = round(curr_paid + payment_amount, 2)
+            if new_paid > total_amount:
+                raise ValueError(f"Financial Error: Payment amount ({payment_amount}) brings total paid ({new_paid}) above obligation amount ({total_amount}). Maximum remaining payable is {round(total_amount - curr_paid, 2)}.")
             
             payment_mode = normalize_and_validate_payment_mode(args.get("payment_mode", "UPI"))
             payment_reference = sanitize_text(args.get("payment_reference"), "payment_reference")
@@ -1465,7 +1560,7 @@ def handle_manage_treasury(args):
             closed_ref = payment_reference if is_settled else t_curr["closed_reference"]
 
             existing_closed_note = t_curr["closed_note"] or ""
-            payment_entry = f"• [Payment: ₹{payment_amount} via {payment_mode} on {today}" + (f" (Ref: {payment_reference})" if payment_reference else "") + (f"] {note}" if note else "")
+            payment_entry = f"- [Payment: ₹{payment_amount} via {payment_mode} on {today}" + (f" (Ref: {payment_reference})" if payment_reference else "") + (f"] {note}" if note else "")
             combined_note = (existing_closed_note + "\n" + payment_entry).strip()
 
             conn.execute("""
@@ -1597,7 +1692,7 @@ def handle_manage_counterparty(args):
     with get_db() as conn:
         if action == "create":
             name = sanitize_text(args.get("name"), "name", required=True)
-            existing = conn.execute("SELECT id FROM Counterparties WHERE name = ?", (name,)).fetchone()
+            existing = conn.execute("SELECT id FROM Counterparties WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
             if existing:
                 raise ValueError(f"Relational Error: Counterparty with name '{name}' already exists (ID: {existing['id']}).")
             
@@ -1638,6 +1733,9 @@ def handle_manage_counterparty(args):
                 if col in allowed_cols:
                     if col == "name":
                         val = sanitize_text(val, col, required=True)
+                        collision = conn.execute("SELECT id FROM Counterparties WHERE name = ? COLLATE NOCASE AND id != ?", (val, counterparty_id)).fetchone()
+                        if collision:
+                            raise ValueError(f"Relational Error: Counterparty name '{val}' is already taken by ID {collision['id']}.")
                     elif col == "relation":
                         val = normalize_and_validate_relation(val)
                     elif col == "activity":
@@ -1771,6 +1869,20 @@ def handle_audit_health(args):
             if prio not in VALID_PRIORITIES:
                 schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "priority", "value": prio, "issue": f"Invalid priority '{prio}'."})
 
+            # Financial Ledger Invariants
+            amt = float(tr_dict.get("amount") or 0.0)
+            paid = float(tr_dict.get("paid_amount") or 0.0)
+            if amt <= 0.0:
+                schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "amount", "value": amt, "issue": "Committed obligation amount must be strictly greater than 0.0."})
+            if paid < 0.0:
+                schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "paid_amount", "value": paid, "issue": "Paid amount cannot be negative."})
+            if paid > amt:
+                schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "paid_amount", "value": paid, "issue": f"Paid amount ({paid}) exceeds committed amount ({amt})."})
+            if st == "Closed" and status == "Paid" and paid < amt:
+                schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "status", "value": f"Paid (Balance: {round(amt - paid, 2)})", "issue": "Obligation marked 'Paid' but paid_amount is less than committed amount."})
+            if st == "Closed" and not tr_dict.get("closed_at"):
+                schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "closed_at", "value": None, "issue": "Closed obligation is missing 'closed_at' settlement date."})
+
             for d_col in ["opened_at", "closed_at", "promise_date", "expected_date", "updated_at"]:
                 val = tr_dict.get(d_col)
                 if val and parse_date_obj(val) is None:
@@ -1811,10 +1923,22 @@ def handle_audit_health(args):
             WHERE s.task_id IS NOT NULL AND t.id IS NULL
         """).fetchall()
 
+        orphan_strike_subtasks = conn.execute("""
+            SELECT s.* FROM Strikes s
+            LEFT JOIN Subtasks sub ON s.subtask_id = sub.id
+            WHERE s.subtask_id IS NOT NULL AND sub.id IS NULL
+        """).fetchall()
+
         orphan_treasury = conn.execute("""
             SELECT tr.* FROM Treasury tr
             LEFT JOIN Counterparties c ON tr.counterparty_id = c.id
             WHERE c.id IS NULL
+        """).fetchall()
+
+        orphan_treasury_campaigns = conn.execute("""
+            SELECT tr.* FROM Treasury tr
+            LEFT JOIN Tasks t ON tr.campaign_id = t.id
+            WHERE tr.campaign_id IS NOT NULL AND t.id IS NULL
         """).fetchall()
 
         orphan_tags = conn.execute("""
@@ -1826,13 +1950,14 @@ def handle_audit_health(args):
         issues_count = (
             len(overdue_tasks) + len(missing_deadline_tasks) + len(stale_strikes) +
             len(schema_rule_violations) + len(missing_indexes) +
-            len(orphan_subtasks) + len(orphan_strikes) + len(orphan_treasury) + len(orphan_tags)
+            len(orphan_subtasks) + len(orphan_strikes) + len(orphan_strike_subtasks) +
+            len(orphan_treasury) + len(orphan_treasury_campaigns) + len(orphan_tags)
         )
         
         if issues_count == 0:
             health_status = "OPTIMAL_HEALTH"
             summary = "All campaigns, daily strikes, counterparties, treasury obligations, schema rules, and database indexes are 100% compliant and healthy."
-        elif len(schema_rule_violations) > 0 or len(missing_indexes) > 0 or len(orphan_subtasks) > 0 or len(orphan_strikes) > 0 or len(orphan_treasury) > 0:
+        elif len(schema_rule_violations) > 0 or len(missing_indexes) > 0 or len(orphan_subtasks) > 0 or len(orphan_strikes) > 0 or len(orphan_strike_subtasks) > 0 or len(orphan_treasury) > 0 or len(orphan_treasury_campaigns) > 0:
             health_status = "ATTENTION_REQUIRED"
             summary = f"Detected {len(schema_rule_violations)} schema violations, {len(missing_indexes)} missing indexes, {len(overdue_tasks)} overdue campaigns, and {len(stale_strikes)} stale strikes."
         else:
@@ -1850,7 +1975,7 @@ def handle_audit_health(args):
             remediations.append(f"Neutralize, reschedule, or abort {len(stale_strikes)} past strikes.")
         if missing_deadline_tasks:
             remediations.append(f"Assign mandatory deadlines to {len(missing_deadline_tasks)} active execution campaigns.")
-        if orphan_subtasks or orphan_strikes or orphan_treasury or orphan_tags:
+        if orphan_subtasks or orphan_strikes or orphan_strike_subtasks or orphan_treasury or orphan_treasury_campaigns or orphan_tags:
             remediations.append("Prune or re-link orphaned records.")
 
         return {
@@ -1866,7 +1991,9 @@ def handle_audit_health(args):
             "orphaned_entities": {
                 "subtasks": [dict(r) for r in orphan_subtasks],
                 "strikes": [dict(r) for r in orphan_strikes],
+                "strike_subtasks": [dict(r) for r in orphan_strike_subtasks],
                 "treasury": [dict(r) for r in orphan_treasury],
+                "treasury_campaigns": [dict(r) for r in orphan_treasury_campaigns],
                 "tags": [dict(r) for r in orphan_tags]
             },
             "remediation_actions": remediations

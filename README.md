@@ -72,7 +72,7 @@
 - ⚡ **High-Speed Relational Engine**: Direct SQLite access in WAL mode with sub-millisecond query latency.
 - 💰 **Relational Treasury & Counterparties**: Track payables, receivables, debt dues, invoices, and partial payment history with live computed net balances.
 - 🌳 **Hierarchical Subtask Trees**: Multi-level subtasks (`Initiated` ➔ `Doing` ➔ `Completed` / `Failed`).
-- 🎯 **Daily Tactical Strikes**: Track daily battle directives with strict completion status (`NEUTRALIZED`).
+- 🎯 **Daily Tactical Strikes**: Track daily battle directives with strict completion status (`Neutralized`).
 - 🩺 **Automated Health Auditor**: `campaigns_audit_health` detects orphaned strikes, overdue deadlines, and stale directives in a single pass.
 - 🛡️ **Zero Secret / Data Leaks**: Database location is fully configurable; schemas and initializers keep personal state isolated.
 
