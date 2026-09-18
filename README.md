@@ -50,6 +50,7 @@
 ## 📑 Table of Contents
 - [✨ Core Capabilities](#-core-capabilities)
 - [🏛️ System Architecture](#️-system-architecture)
+- [⚡ AI-First Architecture](#-ai-first-architecture)
 - [🛠️ Tool Catalog (20 Operations)](#️-tool-catalog-20-operations)
 - [📊 Database Schema & LifeCycle](#-database-schema--lifecycle)
 - [🚀 Quickstart & Setup](#-quickstart--setup)
@@ -107,6 +108,20 @@
 
 ---
 
+### ⚡ AI-First Architecture: "Minimum Token Consumption, Maximum Speed"
+
+The server is architected from the ground up for autonomous AI agent operation, enforcing radical token efficiency and sub-millisecond execution velocity:
+
+- 📉 **Compact List Payloads (80–85% Token Reduction)**: `campaigns_list_tasks` defaults to `include_description: false`, omitting lengthy mission briefings and debrief notes from query outputs. Agents consume only essential metadata (`id`, `title`, `state`, `stage`, `priority`, `deadline`) unless explicitly passing `include_description: true`.
+- 🌳 **1-Shot Multi-Subtask Inception**: `campaigns_create_task` accepts an optional `subtasks: ["Phase 1", "Phase 2"]` array. The server creates the campaign and all checkpoint subtasks in a **single atomic transaction**, slashing 4–6 tool calls down to 1.
+- 🎯 **1-Shot Relational Resolution**: `campaigns_create_strike` accepts `task_title` / `task_name` and `subtask_title` parameters. The server resolves foreign keys dynamically in a single SQL transaction—eliminating redundant `campaigns_list_tasks` round-trips.
+- ⚡ **Flat Top-Level Mutation Shortcuts**: `campaigns_update_task` and `campaigns_update_strike` accept parameters directly at the top level (e.g. `status="Neutralized"`, `stage="Executing"`), omitting verbose nested `fields: {}` dictionaries.
+- 📅 **Deterministic Relative Date Engine**: `sanitize_date` natively parses natural relative expressions (`today`, `tomorrow`, `+3d`, `+2w`, `+1m`, `eom`, `monday`, `friday`), eliminating agent mental date math and calculation errors.
+- 💰 **Horizon-Segmented Runway Telemetry**: `campaigns_get_treasury_dashboard` delivers immediate 7-day and 30-day imminent payables and receivables runway (`imminent_runway`), providing instant cash flow foresight.
+- 📝 **Markdown-Lite Standardization**: Built-in validation ensures descriptive multiline text fields remain short, simple, structured (`- ` bullets, `1. ` lists, `> ` quotes), and free of conversational essay bloat.
+
+---
+
 ## 🛠️ Tool Catalog (20 Operations)
 
 | Category | MCP Tool Name | Description |
@@ -115,21 +130,21 @@
 | | `campaigns_audit_health` | Full database integrity scan across campaigns, strikes, subtasks, and treasury. |
 | **📋 Tasks** | `campaigns_list_tasks` | List and filter campaigns by state (`Arsenal`, `Execution`, `Breach`, `Archive`), stage, or priority. |
 | | `campaigns_get_task_details`| Deep query returning task attributes, subtask tree, connected strikes, and tags. |
-| | `campaigns_create_task` | Create a new campaign with priority, state stage, origin date, and deadline. |
-| | `campaigns_update_task` | Update task fields (state transitions, deadlines, stages) with relational integrity. |
+| | `campaigns_create_task` | Create a new campaign with priority, state stage, origin date, deadline, optional 1-shot `subtasks`, and optional Markdown-Lite mission briefing (`description`). |
+| | `campaigns_update_task` | Update task fields (state transitions, deadlines, stages, `description`, `end_note`) with relational integrity. |
 | | `campaigns_delete_task` | Cascade deletion of a campaign and its associated subtasks and strikes. |
-| **🎯 Strikes** | `campaigns_list_strikes` | List daily strikes filtered by execution date (`DD-MM-YYYY`), status, or Minister. |
-| | `campaigns_create_strike` | Create a daily tactical strike assigned to a Minister with recurrence ID support. |
-| | `campaigns_update_strike` | Update strike status (`STANDBY`, `ENGAGED`, `NEUTRALIZED`, `ABORTED`), date, or notes. |
+| **🎯 Strikes** | `campaigns_list_strikes` | List daily strikes filtered by execution date (`DD-MM-YYYY` or relative date), status, or Minister. |
+| | `campaigns_create_strike` | Create a daily tactical strike assigned to a Minister with 1-shot task title resolution, recurrence ID, and clean Markdown-Lite `notes`. |
+| | `campaigns_update_strike` | Update strike status (`Standby`, `Engaged`, `Neutralized`, `Aborted`, `Pending`, `Template`, `Undated`), date, or Markdown-Lite `notes`. Supports flat top-level shortcuts. |
 | | `campaigns_delete_strike` | Remove a strike from the tactical schedule. |
-| **🌳 Subtasks & Tags**| `campaigns_manage_subtask` | Create, update status (`Initiated`/`Doing`/`Completed`), or delete subtask nodes. |
+| **🌳 Subtasks & Tags**| `campaigns_manage_subtask` | Create, update status (`Initiated`, `Doing`, `Completed`, `Failed`), or delete subtask nodes. |
 | | `campaigns_manage_tag` | Attach or detach uppercase taxonomy tags (`GOVT`, `RECRUITMENT`, `MOTOR_WINDING`). |
-| **💰 Treasury & Finance**| `campaigns_get_treasury_dashboard`| 1-shot financial summary: payables due, receivables due, net position, overdues. |
-| | `campaigns_list_treasury` | Filter financial obligations across `flow_type`, `state`, `category`, and `counterparty_id`. |
-| | `campaigns_manage_treasury` | Create obligations, update terms, record partial payments, or delete records. |
-| **👥 Counterparties**| `campaigns_list_counterparties` | Directory of persons and entities with live computed net balances and total dues. |
+| **💰 Treasury & Finance**| `campaigns_get_treasury_dashboard`| 1-shot financial summary: payables due, receivables due, 7-day & 30-day runway horizons, net position, overdues. |
+| | `campaigns_list_treasury` | Filter financial obligations across `flow_type` (`Payable`/`Receivable`), `state` (`Open`/`Closed`), `status` (`In Progress`, `Partially Paid`, `Pending`, `Disputed`, `Paid`, `Settled`, `Defaulted`), `category`, and `counterparty_id`. |
+| | `campaigns_manage_treasury` | Create obligations, update terms, record partial payments, or delete records. Supports flat top-level arguments (`status`, `state`, `amount`, etc.) and clean Markdown-Lite notes. |
+| **👥 Counterparties**| `campaigns_list_counterparties` | Directory of persons and entities with live computed net balances, total dues, and `activity` filter (`Active`, `Dormant`, `Banned`, `Defaulted`). |
 | | `campaigns_get_counterparty_dossier` | Deep 360° relationship dossier and complete chronological transaction ledger. |
-| | `campaigns_manage_counterparty` | Create, update, or remove counterparty entities. |
+| | `campaigns_manage_counterparty` | Create, update, or remove counterparty entities (supports flat shortcuts and Markdown-Lite `comment`). |
 | **⚡ SQL Engine** | `campaigns_execute_sql` | Execute unrestricted custom SQL queries and transactions with automatic rollback safety. |
 
 ---
@@ -137,7 +152,7 @@
 ## 📊 Database Schema & LifeCycle
 
 ### State Lifecycle Machine
-```
+```text
 ┌─────────────┐       ┌───────────────┐       ┌────────────┐       ┌─────────────┐
 │   Arsenal   │ ───►  │   Execution   │ ───►  │   Breach   │ ───►  │   Archive   │
 │ (Raw Intel) │       │   (Active)    │       │ (Overdue)  │       │  (Victory)  │
@@ -170,10 +185,10 @@ Add to your `mcp_config.json` or Antigravity MCP settings:
 ```json
 {
   "mcpServers": {
-    "campaigns": {
+    "campaigns-mcp": {
       "command": "python",
       "args": [
-        "C:\\Users\\<USER>\\.gemini\\campaigns-mcp\\server.py"
+        "%USERPROFILE%\\.gemini\\campaigns-mcp\\server.py"
       ]
     }
   }
@@ -186,7 +201,7 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/App
 ```json
 {
   "mcpServers": {
-    "campaigns": {
+    "campaigns-mcp": {
       "command": "python",
       "args": [
         "/path/to/campaigns-mcp/server.py"
@@ -200,11 +215,13 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/App
 
 ## 📐 Tactical Guardrails & Invariants
 
-1. **Strike Completion Standard**: Completed strikes are strictly marked as **`NEUTRALIZED`** (never `COMPLETED`).
-2. **Date Format Standard**: Strict calendar format **`DD-MM-YYYY`**.
-3. **Execution State Mandate**: Any campaign in `state = 'Execution'` strictly requires a valid `deadline`.
-4. **Minister Allocation**: All strikes must be assigned to an active Minister (`Adhipati`, `Bhakta`, `Antaryami`, `Jigyasu`).
-5. **Relational Integrity**: Treasury obligations strictly enforce foreign keys referencing `Counterparties(id)`.
+1. **Strike Completion Standard**: Completed strikes are strictly marked as **`Neutralized`** (never `Completed`, `Done`, etc.).
+2. **Date Format Standard**: Strict calendar format **`DD-MM-YYYY`** with zero time/hour/second concept.
+3. **Capitalized Case Standard**: All closed enums (`Tasks.state`/`stage`/`priority`, `Strikes.status`/`assigned`, `Subtasks.status`, `Treasury.state`/`status`/`flow_type`/`priority`, `Counterparties.activity`) store strictly Capitalized Case values. Tags are the sole exception and must be `UPPERCASE`.
+4. **Execution State Mandate**: Any campaign in `state = 'Execution'` strictly requires a valid `deadline`.
+5. **Minister Allocation**: All strikes must be assigned to an active Minister (`Adhipati`, `Bhakta`, `Antaryami`, `Jigyasu`).
+6. **Relational Integrity**: Treasury obligations strictly enforce foreign keys referencing `Counterparties(id)`.
+7. **Markdown-Lite Text Formatting Protocol**: All multi-line text fields (`Tasks.description`, `Tasks.end_note`, `Strikes.notes`, `Treasury.opened_note`, `Treasury.closed_note`, `Counterparties.comment`) render in the UI via native Markdown-Lite parsers. Text must be kept **short, simple, crisp, and well-formatted** using standard markdown (clean `- ` bullet lists, `1. ` numbered lists, `> ` blockquotes, and `**bold**` keys) without essay bloat or visual clutter.
 
 ---
 

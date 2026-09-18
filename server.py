@@ -12,6 +12,7 @@ import re
 import sqlite3
 import datetime
 import traceback
+import contextlib
 
 DB_PATH = os.path.expandvars(r"%APPDATA%\Campaigns\Database\campaigns.sqlite")
 
@@ -37,10 +38,22 @@ VALID_SUBTASK_STATUSES = ["Initiated", "Doing", "Completed", "Failed"]
 
 # Financial / Treasury & Counterparties Whitelists
 VALID_FLOW_TYPES = ["Payable", "Receivable"]
-VALID_TREASURY_STATES = ["Open", "Closed", "Cancelled"]
-VALID_TREASURY_STATUSES = ["In Progress", "Paid", "Partially Paid", "Settled", "Cancelled"]
-VALID_RELATIONS = ["Personal", "Friend", "Family", "Client", "Vendor", "Broker", "Bank", "Other"]
-VALID_ACTIVITIES = ["Active", "Dormant", "Archived"]
+VALID_TREASURY_STATES = ["Open", "Closed"]
+VALID_TREASURY_STATUSES = [
+    "In Progress",
+    "Partially Paid",
+    "Pending",
+    "Disputed",
+    "Paid",
+    "Settled",
+    "Defaulted"
+]
+VALID_STATUSES_BY_STATE = {
+    "Open": ["In Progress", "Partially Paid", "Pending", "Disputed"],
+    "Closed": ["Paid", "Settled", "Defaulted"]
+}
+VALID_RELATIONS = ["Personal", "Friend", "Family", "Client", "Vendor", "Broker", "Bank", "Landlord", "Other"]
+VALID_ACTIVITIES = ["Active", "Dormant", "Banned", "Defaulted"]
 VALID_MODES = ["UPI", "Cash", "NetBanking", "Card", "Barter", "Other"]
 
 VALID_TREASURY_CATEGORIES = [
@@ -56,15 +69,24 @@ VALID_TREASURY_CATEGORIES = [
     "Other"
 ]
 
+@contextlib.contextmanager
 def get_db():
     db_dir = os.path.dirname(DB_PATH)
     if not os.path.exists(db_dir):
         os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA synchronous = NORMAL;")
+    conn.execute("PRAGMA busy_timeout = 10000;")
     conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def get_today_str():
     return datetime.datetime.now().strftime("%d-%m-%Y")
@@ -153,10 +175,57 @@ def sanitize_date(date_str, field_name="date", required=False):
         if required:
             raise ValueError(f"Validation Error: '{field_name}' date is required.")
         return None
-    clean = str(date_str).strip()
-    parts = clean.replace("/", "-").replace(".", "-").split("-")
+    raw = str(date_str).strip()
+    clean_lower = raw.lower().lstrip("@")
+    today = datetime.date.today()
+
+    # Relative shortcuts:
+    if clean_lower in ["today", "now"]:
+        return today.strftime("%d-%m-%Y")
+    elif clean_lower in ["tomorrow", "tom", "tmrw"]:
+        return (today + datetime.timedelta(days=1)).strftime("%d-%m-%Y")
+    elif clean_lower in ["yesterday", "yest"]:
+        return (today - datetime.timedelta(days=1)).strftime("%d-%m-%Y")
+    elif clean_lower == "eom":
+        # End of current month
+        next_m = today.month % 12 + 1
+        next_y = today.year + (1 if today.month == 12 else 0)
+        eom_date = datetime.date(next_y, next_m, 1) - datetime.timedelta(days=1)
+        return eom_date.strftime("%d-%m-%Y")
+
+    # +Nd / +Nw / +Nm pattern (e.g. +3d, +2w, +1m)
+    rel_match = re.match(r"^\+(\d+)([dwm]?)$", clean_lower)
+    if rel_match:
+        qty = int(rel_match.group(1))
+        unit = rel_match.group(2) or "d"
+        if unit == "d":
+            return (today + datetime.timedelta(days=qty)).strftime("%d-%m-%Y")
+        elif unit == "w":
+            return (today + datetime.timedelta(weeks=qty)).strftime("%d-%m-%Y")
+        elif unit == "m":
+            return (today + datetime.timedelta(days=qty * 30)).strftime("%d-%m-%Y")
+
+    # Day of week name (e.g. monday, friday) -> next occurrence
+    weekdays = {
+        "monday": 0, "mon": 0,
+        "tuesday": 1, "tue": 1,
+        "wednesday": 2, "wed": 2,
+        "thursday": 3, "thu": 3,
+        "friday": 4, "fri": 4,
+        "saturday": 5, "sat": 5,
+        "sunday": 6, "sun": 6
+    }
+    if clean_lower in weekdays:
+        target_wd = weekdays[clean_lower]
+        days_ahead = (target_wd - today.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        return (today + datetime.timedelta(days=days_ahead)).strftime("%d-%m-%Y")
+
+    clean = raw.replace("/", "-").replace(".", "-")
+    parts = clean.split("-")
     if len(parts) != 3:
-        raise ValueError(f"Validation Error: '{field_name}' must be formatted as DD-MM-YYYY, received '{date_str}'.")
+        raise ValueError(f"Validation Error: '{field_name}' must be formatted as DD-MM-YYYY or relative shortcut ('today', '+3d', 'monday', 'eom'), received '{date_str}'.")
     
     try:
         if len(parts[0]) == 4:  # YYYY-MM-DD
@@ -342,14 +411,44 @@ def normalize_and_validate_treasury_category(category):
 def normalize_and_validate_treasury_state(state):
     if not state:
         return "Open"
-    st = str(state).strip().capitalize()
-    if st in ["Settled", "Paid", "Done", "Closed"]:
+    st = str(state).strip().lower()
+    if st in ["closed", "settled", "paid", "defaulted", "done", "close"]:
         return "Closed"
-    if st in ["Cancelled", "Abort", "Aborted"]:
-        return "Cancelled"
-    if st not in VALID_TREASURY_STATES:
-        raise ValueError(f"Invalid treasury state '{state}'. Allowed values: {VALID_TREASURY_STATES}")
-    return st
+    if st in ["open", "in progress", "pending", "disputed", "active"]:
+        return "Open"
+    if st.capitalize() in VALID_TREASURY_STATES:
+        return st.capitalize()
+    raise ValueError(f"Invalid treasury state '{state}'. Allowed closed enum: {VALID_TREASURY_STATES}")
+
+def normalize_and_validate_treasury_status(status, state="Open"):
+    norm_state = normalize_and_validate_treasury_state(state)
+    if not status:
+        return "Paid" if norm_state == "Closed" else "In Progress"
+    clean = str(status).strip().lower()
+    if norm_state == "Closed":
+        if any(w in clean for w in ["default", "betray", "bad debt", "loss", "denied"]):
+            return "Defaulted"
+        if any(w in clean for w in ["settle", "haircut", "barter", "compromise"]):
+            return "Settled"
+        if any(w in clean for w in ["paid", "complete", "cleared", "full"]):
+            return "Paid"
+        for s in VALID_STATUSES_BY_STATE["Closed"]:
+            if s.lower() == clean:
+                return s
+        raise ValueError(f"Invalid status '{status}' for state 'Closed'. Allowed values: {VALID_STATUSES_BY_STATE['Closed']}")
+    else:
+        if any(w in clean for w in ["partially", "partial"]):
+            return "Partially Paid"
+        if any(w in clean for w in ["pending", "overdue", "delayed"]):
+            return "Pending"
+        if any(w in clean for w in ["dispute", "conflict", "hold"]):
+            return "Disputed"
+        if any(w in clean for w in ["in progress", "progress", "active", "doing"]):
+            return "In Progress"
+        for s in VALID_STATUSES_BY_STATE["Open"]:
+            if s.lower() == clean:
+                return s
+        raise ValueError(f"Invalid status '{status}' for state 'Open'. Allowed values: {VALID_STATUSES_BY_STATE['Open']}")
 
 def normalize_and_validate_payment_mode(mode):
     if not mode:
@@ -374,13 +473,19 @@ def normalize_and_validate_relation(relation):
 def normalize_and_validate_activity(activity):
     if not activity:
         return "Active"
-    a_clean = str(activity).strip().capitalize()
+    a_clean = str(activity).strip().lower()
+    if any(w in a_clean for w in ["ban", "block", "blacklist"]):
+        return "Banned"
+    if any(w in a_clean for w in ["default", "betray", "fraud"]):
+        return "Defaulted"
+    if any(w in a_clean for w in ["dormant", "inactive", "archive"]):
+        return "Dormant"
+    if "active" in a_clean:
+        return "Active"
     for a in VALID_ACTIVITIES:
-        if a.lower() == a_clean.lower():
+        if a.lower() == a_clean:
             return a
-    if a_clean not in VALID_ACTIVITIES:
-        raise ValueError(f"Invalid activity '{activity}'. Allowed values: {VALID_ACTIVITIES}")
-    return a_clean
+    raise ValueError(f"Invalid activity '{activity}'. Allowed closed enum: {VALID_ACTIVITIES}")
 
 def extract_smart_tokens(title, execution_date=None, assigned=None):
     clean_title = sanitize_text(title, "title", required=True)
@@ -432,7 +537,8 @@ def handle_get_dashboard(args):
         ).fetchall()
         
         execution_tasks = conn.execute(
-            """SELECT t.*, 
+            """SELECT t.id, t.title, t.priority, t.state, t.stage, t.deadline, t.initiated_at, t.reschedule_count,
+                      (t.description != '' AND t.description IS NOT NULL) as has_description,
                       (SELECT COUNT(*) FROM Subtasks WHERE task_id = t.id) as subtask_count,
                       (SELECT COUNT(*) FROM Subtasks WHERE task_id = t.id AND status = 'Completed') as subtask_done_count
                FROM Tasks t
@@ -471,12 +577,24 @@ def handle_list_tasks(args):
     search = sanitize_text(args.get("search"), "search")
     tag = args.get("tag")
     limit = sanitize_integer(args.get("limit", 50), "limit")
+    include_description = bool(args.get("include_description", False))
 
-    query = """
-        SELECT t.*, 
-               (SELECT GROUP_CONCAT(tag_name, ', ') FROM Tags WHERE task_id = t.id) as tag_names,
-               (SELECT COUNT(*) FROM Subtasks WHERE task_id = t.id) as total_subtasks,
-               (SELECT COUNT(*) FROM Subtasks WHERE task_id = t.id AND status = 'Completed') as done_subtasks
+    if include_description:
+        cols = """t.*, 
+                  (SELECT GROUP_CONCAT(tag_name, ', ') FROM Tags WHERE task_id = t.id) as tag_names,
+                  (SELECT COUNT(*) FROM Subtasks WHERE task_id = t.id) as total_subtasks,
+                  (SELECT COUNT(*) FROM Subtasks WHERE task_id = t.id AND status = 'Completed') as done_subtasks"""
+    else:
+        cols = """t.id, t.title, t.priority, t.state, t.stage, t.origin_date, t.deadline, t.initiated_at, 
+                  t.reschedule_count, t.ended_date, t.days_spent, t.is_breached_extracted,
+                  (t.description != '' AND t.description IS NOT NULL) as has_description,
+                  (t.end_note != '' AND t.end_note IS NOT NULL) as has_end_note,
+                  (SELECT GROUP_CONCAT(tag_name, ', ') FROM Tags WHERE task_id = t.id) as tag_names,
+                  (SELECT COUNT(*) FROM Subtasks WHERE task_id = t.id) as total_subtasks,
+                  (SELECT COUNT(*) FROM Subtasks WHERE task_id = t.id AND status = 'Completed') as done_subtasks"""
+
+    query = f"""
+        SELECT {cols}
         FROM Tasks t
         WHERE 1=1
     """
@@ -494,8 +612,8 @@ def handle_list_tasks(args):
         query += " AND t.priority = ?"
         params.append(normalize_and_validate_priority(priority))
     if search:
-        query += " AND (t.title LIKE ? OR t.end_note LIKE ?)"
-        params.extend([f"%{search}%", f"%{search}%"])
+        query += " AND (t.title LIKE ? OR t.end_note LIKE ? OR t.description LIKE ?)"
+        params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
     if tag:
         clean_tag = sanitize_tag_name(tag)
         query += " AND EXISTS (SELECT 1 FROM Tags WHERE task_id = t.id AND tag_name LIKE ?)"
@@ -546,6 +664,18 @@ def handle_create_task(args):
             clean_title = re.sub(pattern, "", clean_title, flags=re.IGNORECASE).strip()
             break
 
+    raw_tags = args.get("tags", [])
+    if not isinstance(raw_tags, list):
+        raw_tags = []
+
+    # AI Velocity: Automatically extract inline #TAG tokens from title
+    for tag_match in re.findall(r"#([A-Za-z0-9_\-]+)", clean_title):
+        if tag_match.capitalize() not in ["High", "Medium", "Low", "Med"]:
+            raw_tags.append(tag_match)
+            clean_title = re.sub(rf"#{re.escape(tag_match)}\b", "", clean_title).strip()
+
+    clean_title = re.sub(r"\s+", " ", clean_title).strip()
+
     priority = normalize_and_validate_priority(priority)
     state, stage = normalize_and_validate_task_state_stage(args.get("state", "Arsenal"), args.get("stage"))
     origin_date = sanitize_date(args.get("origin_date"), "origin_date") or get_today_str()
@@ -572,51 +702,81 @@ def handle_create_task(args):
             base_str = initiated_at if initiated_at else origin_date
             raise ValueError(f"Chronological Error: 'deadline' ({deadline}) cannot be earlier than inception/initiation date ({base_str}).")
 
-    raw_tags = args.get("tags", [])
     tags = []
-    if raw_tags and isinstance(raw_tags, list):
-        for t in raw_tags:
-            try:
-                tags.append(sanitize_tag_name(t))
-            except ValueError:
-                pass
+    for t in raw_tags:
+        try:
+            tags.append(sanitize_tag_name(t))
+        except ValueError:
+            pass
+
+    description = sanitize_text(args.get("description"), "description", max_len=10000) or ""
 
     with get_db() as conn:
         cur = conn.execute(
-            """INSERT INTO Tasks (title, origin_date, modification_date, priority, state, stage, deadline, initiated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (clean_title, origin_date, modification_date, priority, state, stage, deadline, initiated_at)
+            """INSERT INTO Tasks (title, description, origin_date, modification_date, priority, state, stage, deadline, initiated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (clean_title, description, origin_date, modification_date, priority, state, stage, deadline, initiated_at)
         )
         task_id = cur.lastrowid
 
         for t in tags:
             conn.execute("INSERT INTO Tags (task_id, tag_name) VALUES (?, ?)", (task_id, t))
 
+        subtasks_created = []
+        raw_subtasks = args.get("subtasks", [])
+        if isinstance(raw_subtasks, list):
+            for st_item in raw_subtasks:
+                if isinstance(st_item, str) and st_item.strip():
+                    st_title = sanitize_text(st_item, "subtask_title", required=True)
+                    st_cur = conn.execute(
+                        "INSERT INTO Subtasks (task_id, title, created_at, status) VALUES (?, ?, ?, 'Initiated')",
+                        (task_id, st_title, origin_date)
+                    )
+                    subtasks_created.append({"id": st_cur.lastrowid, "title": st_title, "status": "Initiated"})
+                elif isinstance(st_item, dict) and st_item.get("title"):
+                    st_title = sanitize_text(st_item.get("title"), "subtask_title", required=True)
+                    st_status = normalize_and_validate_subtask_status(st_item.get("status", "Initiated"))
+                    st_cur = conn.execute(
+                        "INSERT INTO Subtasks (task_id, title, created_at, status) VALUES (?, ?, ?, ?)",
+                        (task_id, st_title, origin_date, st_status)
+                    )
+                    subtasks_created.append({"id": st_cur.lastrowid, "title": st_title, "status": st_status})
+
         conn.commit()
         return {
             "success": True,
             "task_id": task_id,
             "title": clean_title,
+            "description": description,
             "state": state,
             "stage": stage,
             "priority": priority,
             "origin_date": origin_date,
             "deadline": deadline,
             "initiated_at": initiated_at,
-            "tags": tags
+            "tags": tags,
+            "subtasks": subtasks_created
         }
 
 def handle_update_task(args):
     task_id = sanitize_integer(args.get("task_id"), "task_id", required=True)
     fields = args.get("fields", {})
-    if not fields or not isinstance(fields, dict):
-        raise ValueError("Security Error: 'fields' must be a valid key-value object.")
+    if not isinstance(fields, dict):
+        fields = {}
 
     allowed_columns = [
-        "title", "origin_date", "modification_date", "priority", "state", "stage",
+        "title", "description", "origin_date", "modification_date", "priority", "state", "stage",
         "deadline", "initiated_at", "reschedule_count", "reschedule_1", "reschedule_2",
         "ended_date", "end_note", "days_spent", "is_breached_extracted"
     ]
+
+    # AI Ergonomics: Allow top-level column shortcuts without requiring nested fields object
+    for col in allowed_columns:
+        if col in args and col not in fields:
+            fields[col] = args[col]
+
+    if not fields:
+        raise ValueError("Security Error: 'fields' must contain at least one column to update.")
 
     with get_db() as conn:
         verify_task_exists(conn, task_id)
@@ -689,8 +849,8 @@ def handle_update_task(args):
                     val = sanitize_integer(val, col, allow_zero=True)
                 elif col == "title":
                     val = sanitize_task_title(val)
-                elif col == "end_note":
-                    val = sanitize_text(val, col)
+                elif col in ["end_note", "description"]:
+                    val = sanitize_text(val, col, max_len=10000)
                 updates.append(f"{col} = ?")
                 params.append(val)
 
@@ -717,41 +877,57 @@ def handle_delete_task(args):
         return {"success": True, "task_id": task_id, "message": f"Task {task_id} and associated subtasks/tags deleted."}
 
 def handle_list_strikes(args):
-    execution_date = sanitize_date(args.get("execution_date"), "execution_date")
+    execution_date_raw = args.get("execution_date")
+    if str(execution_date_raw).lower() in ["today", "@today"]:
+        execution_date = get_today_str()
+    elif str(execution_date_raw).lower() in ["tomorrow", "@tomorrow"]:
+        execution_date = (datetime.datetime.now() + datetime.timedelta(days=1)).strftime("%d-%m-%Y")
+    else:
+        execution_date = sanitize_date(execution_date_raw, "execution_date")
+
     assigned = args.get("assigned")
     status = args.get("status")
     task_id = sanitize_integer(args.get("task_id"), "task_id")
+    task_title = sanitize_text(args.get("task_title") or args.get("task_name"), "task_title")
     subtask_id = sanitize_integer(args.get("subtask_id"), "subtask_id")
     limit = sanitize_integer(args.get("limit", 100), "limit")
 
-    query = """
-        SELECT s.*, t.title as task_title, sub.title as subtask_title
-        FROM Strikes s
-        LEFT JOIN Tasks t ON s.task_id = t.id
-        LEFT JOIN Subtasks sub ON s.subtask_id = sub.id
-        WHERE 1=1
-    """
-    params = []
-    if execution_date:
-        query += " AND s.execution_date = ?"
-        params.append(execution_date)
-    if assigned:
-        query += " AND s.assigned = ?"
-        params.append(validate_minister(assigned))
-    if status:
-        query += " AND s.status = ?"
-        params.append(normalize_and_validate_strike_status(status))
-    if task_id:
-        query += " AND s.task_id = ?"
-        params.append(task_id)
-    if subtask_id:
-        query += " AND s.subtask_id = ?"
-        params.append(subtask_id)
-
-    query += " ORDER BY s.id DESC LIMIT ?"
-    params.append(limit)
-
     with get_db() as conn:
+        if not task_id and task_title:
+            t_row = conn.execute(
+                "SELECT id FROM Tasks WHERE title LIKE ? ORDER BY CASE WHEN title = ? THEN 1 ELSE 2 END, id DESC LIMIT 1",
+                (f"%{task_title}%", task_title)
+            ).fetchone()
+            if t_row:
+                task_id = t_row["id"]
+
+        query = """
+            SELECT s.*, t.title as task_title, sub.title as subtask_title
+            FROM Strikes s
+            LEFT JOIN Tasks t ON s.task_id = t.id
+            LEFT JOIN Subtasks sub ON s.subtask_id = sub.id
+            WHERE 1=1
+        """
+        params = []
+        if execution_date:
+            query += " AND s.execution_date = ?"
+            params.append(execution_date)
+        if assigned:
+            query += " AND s.assigned = ?"
+            params.append(validate_minister(assigned))
+        if status:
+            query += " AND s.status = ?"
+            params.append(normalize_and_validate_strike_status(status))
+        if task_id:
+            query += " AND s.task_id = ?"
+            params.append(task_id)
+        if subtask_id:
+            query += " AND s.subtask_id = ?"
+            params.append(subtask_id)
+
+        query += " ORDER BY s.id DESC LIMIT ?"
+        params.append(limit)
+
         rows = conn.execute(query, params).fetchall()
         return {"count": len(rows), "strikes": [dict(r) for r in rows]}
 
@@ -768,14 +944,33 @@ def handle_create_strike(args):
     assigned = validate_minister(assigned)
     created_at = sanitize_date(args.get("created_at"), "created_at") or get_today_str()
     status = normalize_and_validate_strike_status(args.get("status", "Standby"))
-    notes = sanitize_text(args.get("notes"), "notes")
+    notes = sanitize_text(args.get("notes"), "notes", max_len=10000)
     task_id = sanitize_integer(args.get("task_id"), "task_id")
+    task_title = sanitize_text(args.get("task_title") or args.get("task_name"), "task_title")
     subtask_id = sanitize_integer(args.get("subtask_id"), "subtask_id")
+    subtask_title = sanitize_text(args.get("subtask_title") or args.get("subtask_name"), "subtask_title")
     recurrence_id = sanitize_text(args.get("recurrence_id"), "recurrence_id", max_len=50)
 
     with get_db() as conn:
+        # AI Velocity: 1-shot auto-resolution of task_id by title/name
+        if not task_id and task_title:
+            t_row = conn.execute(
+                "SELECT id, title FROM Tasks WHERE title LIKE ? ORDER BY CASE WHEN title = ? THEN 1 ELSE 2 END, id DESC LIMIT 1",
+                (f"%{task_title}%", task_title)
+            ).fetchone()
+            if t_row:
+                task_id = t_row["id"]
+
         if task_id:
             verify_task_exists(conn, task_id)
+            if not subtask_id and subtask_title:
+                s_row = conn.execute(
+                    "SELECT id FROM Subtasks WHERE task_id = ? AND title LIKE ? ORDER BY id DESC LIMIT 1",
+                    (task_id, f"%{subtask_title}%")
+                ).fetchone()
+                if s_row:
+                    subtask_id = s_row["id"]
+
         if subtask_id:
             sub = verify_subtask_exists(conn, subtask_id)
             if not task_id:
@@ -801,10 +996,18 @@ def handle_create_strike(args):
 def handle_update_strike(args):
     strike_id = sanitize_integer(args.get("strike_id"), "strike_id", required=True)
     fields = args.get("fields", {})
-    if not fields or not isinstance(fields, dict):
-        raise ValueError("Security Error: 'fields' must be a valid key-value object.")
+    if not isinstance(fields, dict):
+        fields = {}
 
     allowed_columns = ["title", "execution_date", "assigned", "status", "notes", "task_id", "subtask_id", "reschedule_count", "recurrence_id"]
+
+    # AI Ergonomics: Allow top-level argument shortcuts (e.g. strike_id=12, status="Neutralized")
+    for col in allowed_columns:
+        if col in args and col not in fields:
+            fields[col] = args[col]
+
+    if not fields:
+        raise ValueError("Security Error: 'fields' or top-level column values must be provided.")
 
     with get_db() as conn:
         verify_strike_exists(conn, strike_id)
@@ -967,6 +1170,10 @@ def handle_get_treasury_dashboard(args):
         total_receivable_due = 0.0
         total_payable_settled = 0.0
         total_receivable_settled = 0.0
+        payable_due_7d = 0.0
+        payable_due_30d = 0.0
+        receivable_due_7d = 0.0
+        receivable_due_30d = 0.0
         open_payables = []
         open_receivables = []
         overdue_payables = []
@@ -986,24 +1193,38 @@ def handle_get_treasury_dashboard(args):
                 if is_open:
                     total_payable_due += balance
                     open_payables.append(t)
-                    p_date = t.get("promise_date")
+                    p_date = t.get("promise_date") or t.get("expected_date")
                     if p_date:
                         p_dt = parse_date_obj(p_date)
-                        if p_dt and p_dt < ref_dt:
-                            t["days_overdue"] = (ref_dt - p_dt).days
-                            overdue_payables.append(t)
+                        if p_dt:
+                            diff = (p_dt - ref_dt).days
+                            if diff < 0:
+                                t["days_overdue"] = abs(diff)
+                                overdue_payables.append(t)
+                            elif diff <= 7:
+                                payable_due_7d += balance
+                                payable_due_30d += balance
+                            elif diff <= 30:
+                                payable_due_30d += balance
                 else:
                     total_payable_settled += paid_amount
             elif flow == "Receivable":
                 if is_open:
                     total_receivable_due += balance
                     open_receivables.append(t)
-                    e_date = t.get("expected_date")
+                    e_date = t.get("expected_date") or t.get("promise_date")
                     if e_date:
                         e_dt = parse_date_obj(e_date)
-                        if e_dt and e_dt < ref_dt:
-                            t["days_overdue"] = (ref_dt - e_dt).days
-                            overdue_receivables.append(t)
+                        if e_dt:
+                            diff = (e_dt - ref_dt).days
+                            if diff < 0:
+                                t["days_overdue"] = abs(diff)
+                                overdue_receivables.append(t)
+                            elif diff <= 7:
+                                receivable_due_7d += balance
+                                receivable_due_30d += balance
+                            elif diff <= 30:
+                                receivable_due_30d += balance
                 else:
                     total_receivable_settled += paid_amount
 
@@ -1018,6 +1239,12 @@ def handle_get_treasury_dashboard(args):
                 "net_position": round(net_position, 2),
                 "total_payable_settled": round(total_payable_settled, 2),
                 "total_receivable_settled": round(total_receivable_settled, 2),
+                "imminent_runway": {
+                    "payable_due_next_7d": round(payable_due_7d, 2),
+                    "payable_due_next_30d": round(payable_due_30d, 2),
+                    "receivable_due_next_7d": round(receivable_due_7d, 2),
+                    "receivable_due_next_30d": round(receivable_due_30d, 2)
+                },
                 "open_payables_count": len(open_payables),
                 "open_receivables_count": len(open_receivables),
                 "overdue_payables_count": len(overdue_payables),
@@ -1031,6 +1258,7 @@ def handle_get_treasury_dashboard(args):
 def handle_list_treasury(args):
     flow_type = args.get("flow_type")
     state = args.get("state")
+    status = args.get("status")
     category = args.get("category")
     counterparty_id = sanitize_integer(args.get("counterparty_id"), "counterparty_id")
     search = sanitize_text(args.get("search"), "search")
@@ -1053,6 +1281,9 @@ def handle_list_treasury(args):
     if state:
         query += " AND t.state = ?"
         params.append(normalize_and_validate_treasury_state(state))
+    if status:
+        query += " AND t.status = ?"
+        params.append(normalize_and_validate_treasury_status(status, state or "Open"))
     if category:
         query += " AND t.category = ?"
         params.append(normalize_and_validate_treasury_category(category))
@@ -1107,7 +1338,10 @@ def handle_manage_treasury(args):
             paid_amount = sanitize_float(args.get("paid_amount", 0.0), "paid_amount", allow_zero=True)
             priority = normalize_and_validate_priority(args.get("priority", "Medium"))
             state = normalize_and_validate_treasury_state(args.get("state", "Open"))
-            status = "Paid" if state == "Closed" else ("Partially Paid" if paid_amount > 0 else "In Progress")
+            if args.get("status"):
+                status = normalize_and_validate_treasury_status(args.get("status"), state)
+            else:
+                status = "Paid" if state == "Closed" else ("Partially Paid" if paid_amount > 0 else "In Progress")
             opened_at = sanitize_date(args.get("opened_at"), "opened_at") or get_today_str()
             opened_mode = normalize_and_validate_payment_mode(args.get("opened_mode", "UPI"))
             opened_reference = sanitize_text(args.get("opened_reference"), "opened_reference")
@@ -1142,10 +1376,10 @@ def handle_manage_treasury(args):
 
         elif action == "update":
             treasury_id = sanitize_integer(args.get("treasury_id"), "treasury_id", required=True)
-            verify_treasury_exists(conn, treasury_id)
+            curr = verify_treasury_exists(conn, treasury_id)
             fields = args.get("fields", {})
-            if not fields or not isinstance(fields, dict):
-                raise ValueError("Security Error: 'fields' dictionary is required.")
+            if not isinstance(fields, dict):
+                fields = {}
 
             allowed_cols = [
                 "title", "flow_type", "category", "amount", "paid_amount", "priority",
@@ -1154,6 +1388,20 @@ def handle_manage_treasury(args):
                 "closed_mode", "closed_reference", "closed_note", "recurrence_id",
                 "campaign_id", "counterparty_id"
             ]
+
+            # AI Ergonomics: Allow top-level column shortcuts without requiring nested fields object
+            for col in allowed_cols:
+                if col in args and col not in fields:
+                    fields[col] = args[col]
+
+            if not fields:
+                raise ValueError("Security Error: 'fields' must contain at least one column to update.")
+
+            target_state = fields.get("state", curr["state"])
+            if "state" in fields:
+                fields["state"] = normalize_and_validate_treasury_state(fields["state"])
+                target_state = fields["state"]
+
             updates = []
             params = []
             for col, val in fields.items():
@@ -1174,8 +1422,10 @@ def handle_manage_treasury(args):
                         val = normalize_and_validate_priority(val)
                     elif col == "state":
                         val = normalize_and_validate_treasury_state(val)
+                    elif col == "status":
+                        val = normalize_and_validate_treasury_status(val, target_state)
                     elif col in ["opened_mode", "closed_mode"]:
-                        val = normalize_and_validate_payment_mode(val)
+                        val = normalize_and_validate_payment_mode(val) if val else None
                     elif col in ["opened_at", "closed_at", "promise_date", "expected_date"]:
                         val = sanitize_date(val, col)
                     elif col in ["title", "opened_reference", "closed_reference", "opened_note", "closed_note", "recurrence_id"]:
@@ -1369,10 +1619,19 @@ def handle_manage_counterparty(args):
             counterparty_id = sanitize_integer(args.get("counterparty_id"), "counterparty_id", required=True)
             verify_counterparty_exists(conn, counterparty_id)
             fields = args.get("fields", {})
-            if not fields or not isinstance(fields, dict):
-                raise ValueError("Security Error: 'fields' dictionary is required.")
+            if not isinstance(fields, dict):
+                fields = {}
 
             allowed_cols = ["name", "relation", "activity", "contact", "comment"]
+
+            # AI Ergonomics: Allow top-level column shortcuts without requiring nested fields object
+            for col in allowed_cols:
+                if col in args and col not in fields:
+                    fields[col] = args[col]
+
+            if not fields:
+                raise ValueError("Security Error: 'fields' must contain at least one column to update.")
+
             updates = []
             params = []
             for col, val in fields.items():
@@ -1504,7 +1763,11 @@ def handle_audit_health(args):
             if ft not in VALID_FLOW_TYPES:
                 schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "flow_type", "value": ft, "issue": f"Invalid flow_type '{ft}'."})
             if st not in VALID_TREASURY_STATES:
-                schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "state", "value": st, "issue": f"Invalid state '{st}'."})
+                schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "state", "value": st, "issue": f"Invalid state '{st}'. Expected: {VALID_TREASURY_STATES}"})
+            if status not in VALID_TREASURY_STATUSES:
+                schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "status", "value": status, "issue": f"Invalid status '{status}'. Expected Capitalized Case: {VALID_TREASURY_STATUSES}"})
+            elif st in VALID_STATUSES_BY_STATE and status not in VALID_STATUSES_BY_STATE[st]:
+                schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "status", "value": status, "issue": f"Status '{status}' is invalid under state '{st}'. Expected: {VALID_STATUSES_BY_STATE[st]}"})
             if prio not in VALID_PRIORITIES:
                 schema_rule_violations.append({"table": "Treasury", "id": tr_dict["id"], "field": "priority", "value": prio, "issue": f"Invalid priority '{prio}'."})
 
@@ -1665,7 +1928,7 @@ TOOLS = [
     },
     {
         "name": "campaigns_list_tasks",
-        "description": "List and filter tactical campaigns across states (Arsenal, Execution, Breach, Archive), stages, priorities, or tags.",
+        "description": "List and filter tactical campaigns across states (Arsenal, Execution, Breach, Archive), stages, priorities, or tags. Returns compact metadata by default for maximum token efficiency.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1674,13 +1937,14 @@ TOOLS = [
                 "priority": {"type": "string", "enum": ["High", "Medium", "Low"], "description": "Filter by priority."},
                 "search": {"type": "string", "description": "Substring search in task title or notes."},
                 "tag": {"type": "string", "description": "Filter tasks containing this tag name."},
-                "limit": {"type": "integer", "description": "Max tasks to return (default 50)."}
+                "limit": {"type": "integer", "description": "Max tasks to return (default 50)."},
+                "include_description": {"type": "boolean", "default": False, "description": "Set true to include full description and end_note text (default false for 85% token savings)."}
             }
         }
     },
     {
         "name": "campaigns_get_task_details",
-        "description": "Fetch the full interconnected relational tree for a specific campaign: Task record, all subtasks, all strikes (direct and nested), and tags.",
+        "description": "Fetch the full interconnected relational tree for a specific campaign: Task record, full description, all subtasks, all strikes (direct and nested), and tags.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1691,45 +1955,55 @@ TOOLS = [
     },
     {
         "name": "campaigns_create_task",
-        "description": "Create a new campaign task in the SQLite database with strict state/stage validation, calendar date bounds, priority extraction, and initial tag associations.",
+        "description": "Create a new campaign task in the SQLite database with strict state/stage validation, calendar date bounds, priority extraction, initial tag associations, optional 1-shot subtasks creation, and optional short Markdown-Lite mission briefing.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "Task title (supports inline #high, #med, #low)."},
+                "title": {"type": "string", "description": "Task title (supports inline #high, #med, #low and #TAGS)."},
+                "description": {"type": "string", "description": "Short, crisp mission briefing in clean Markdown-Lite format (bullet points, bold keys, clean lists). Keep short, simple, and clutter-free."},
                 "priority": {"type": "string", "enum": ["High", "Medium", "Low", "high", "med", "low"], "default": "Medium", "description": "Priority level."},
                 "state": {"type": "string", "enum": ["Arsenal", "Execution", "Breach", "Archive"], "default": "Arsenal"},
                 "stage": {"type": "string", "enum": ["RawIntel", "Strategizing", "Active", "Executing", "Overdue", "Victory", "Aborted"], "default": "RawIntel"},
-                "origin_date": {"type": "string", "description": "DD-MM-YYYY date. Defaults to today."},
-                "deadline": {"type": "string", "description": "Optional DD-MM-YYYY deadline."},
-                "tags": {"type": "array", "items": {"type": "string"}, "description": "List of tag names (e.g. ['GOVT', 'RECRUITMENT'])."}
+                "origin_date": {"type": "string", "description": "DD-MM-YYYY or relative date ('today', '+3d', 'monday'). Defaults to today."},
+                "deadline": {"type": "string", "description": "Optional DD-MM-YYYY or relative deadline ('+2w', 'eom')."},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "List of tag names (e.g. ['GOVT', 'RECRUITMENT'])."},
+                "subtasks": {"type": "array", "items": {"type": "string"}, "description": "Optional 1-shot list of subtask milestone titles to create with the campaign."}
             },
             "required": ["title"]
         }
     },
     {
         "name": "campaigns_update_task",
-        "description": "Update any column on an existing campaign task record with strict state/stage compatibility and relational verification.",
+        "description": "Update any column on an existing campaign task record with strict state/stage compatibility and relational verification. Supports flat top-level arguments or nested fields object.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "task_id": {"type": "integer", "description": "Task ID to update."},
+                "title": {"type": "string", "description": "Flat shortcut to update title."},
+                "state": {"type": "string", "enum": ["Arsenal", "Execution", "Breach", "Archive"], "description": "Flat shortcut to update state."},
+                "stage": {"type": "string", "enum": ["RawIntel", "Strategizing", "Active", "Executing", "Overdue", "Victory", "Aborted"], "description": "Flat shortcut to update stage."},
+                "priority": {"type": "string", "enum": ["High", "Medium", "Low", "high", "med", "low"], "description": "Flat shortcut to update priority."},
+                "deadline": {"type": "string", "description": "Flat shortcut to update deadline."},
+                "description": {"type": "string", "description": "Flat shortcut to update description in short Markdown-Lite."},
+                "end_note": {"type": "string", "description": "Flat shortcut to update victory/abort note in short Markdown-Lite."},
                 "fields": {
                     "type": "object",
-                    "description": "Key-value dictionary of task columns to update.",
+                    "description": "Optional key-value dictionary of task columns to update.",
                     "properties": {
                         "title": {"type": "string"},
+                        "description": {"type": "string", "description": "Short, crisp mission briefing in clean Markdown-Lite format (bullet points, bold keys, clean lists). Keep short, simple, and clutter-free."},
                         "state": {"type": "string", "enum": ["Arsenal", "Execution", "Breach", "Archive"]},
                         "stage": {"type": "string", "enum": ["RawIntel", "Strategizing", "Active", "Executing", "Overdue", "Victory", "Aborted"]},
                         "priority": {"type": "string", "enum": ["High", "Medium", "Low", "high", "med", "low"]},
                         "deadline": {"type": "string"},
                         "reschedule_count": {"type": "integer"},
                         "ended_date": {"type": "string"},
-                        "end_note": {"type": "string"},
+                        "end_note": {"type": "string", "description": "Victory report or post-mortem debrief in clean Markdown-Lite format. Keep short, simple, and clutter-free."},
                         "days_spent": {"type": "integer"}
                     }
                 }
             },
-            "required": ["task_id", "fields"]
+            "required": ["task_id"]
         }
     },
     {
@@ -1745,14 +2019,15 @@ TOOLS = [
     },
     {
         "name": "campaigns_list_strikes",
-        "description": "List strikes and daily tactical directives filtered by execution date, assigned Minister, status, or task/subtask connection.",
+        "description": "List strikes and daily tactical directives filtered by execution date ('today', 'tomorrow', or DD-MM-YYYY), assigned Minister, status, or connected task.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "execution_date": {"type": "string", "description": "DD-MM-YYYY execution date."},
+                "execution_date": {"type": "string", "description": "Target date: 'today', 'tomorrow', or 'DD-MM-YYYY'."},
                 "assigned": {"type": "string", "enum": ["Adhipati", "Bhakta", "Antaryami", "Jigyasu"], "description": "Assigned Minister entity."},
                 "status": {"type": "string", "enum": ["Standby", "Engaged", "Neutralized", "Aborted", "Pending", "Template", "Undated"], "description": "Strike status."},
                 "task_id": {"type": "integer", "description": "Filter by connected task ID."},
+                "task_title": {"type": "string", "description": "Filter by connected task title (fuzzy lookup)."},
                 "subtask_id": {"type": "integer", "description": "Filter by connected subtask ID."},
                 "limit": {"type": "integer", "default": 100}
             }
@@ -1760,7 +2035,7 @@ TOOLS = [
     },
     {
         "name": "campaigns_create_strike",
-        "description": "Schedule a daily strike/directive. Enforces calendar date bounds, relational ID verification, strict Minister whitelist (Adhipati, Bhakta, Antaryami, Jigyasu), and valid statuses (Standby, Engaged, Neutralized, Aborted, Pending, Template, Undated).",
+        "description": "Schedule a daily strike/directive. Supports 1-shot task linkage via task_title (no need to lookup task_id first), smart tokens (@today, @tomorrow, #Minister), and Markdown-Lite runbook notes.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1768,9 +2043,11 @@ TOOLS = [
                 "execution_date": {"type": "string", "description": "DD-MM-YYYY target date (defaults to today or parsed from title)."},
                 "assigned": {"type": "string", "enum": ["Adhipati", "Bhakta", "Antaryami", "Jigyasu"], "default": "Bhakta", "description": "Assigned Minister."},
                 "status": {"type": "string", "enum": ["Standby", "Engaged", "Neutralized", "Aborted", "Pending", "Template", "Undated"], "default": "Standby"},
-                "notes": {"type": "string", "description": "Optional tactical notes."},
+                "notes": {"type": "string", "description": "Tactical runbook notes in clean Markdown-Lite format (- bullets, 1. steps). Keep short, simple, and clutter-free."},
                 "task_id": {"type": "integer", "description": "Optional linked task ID."},
+                "task_title": {"type": "string", "description": "Optional linked task title/name (1-shot auto-resolves task_id!)."},
                 "subtask_id": {"type": "integer", "description": "Optional linked subtask ID."},
+                "subtask_title": {"type": "string", "description": "Optional linked subtask title (auto-resolves subtask_id)."},
                 "recurrence_id": {"type": "string", "description": "Optional recurrence identifier."}
             },
             "required": ["title"]
@@ -1778,27 +2055,32 @@ TOOLS = [
     },
     {
         "name": "campaigns_update_strike",
-        "description": "Update any attribute of an existing strike with relational checking, strict status (Standby, Engaged, Neutralized, Aborted, Pending, Template, Undated) and Minister validation.",
+        "description": "Update any attribute of an existing strike. Supports flat top-level arguments (e.g. strike_id=12, status='Neutralized') or nested fields object.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "strike_id": {"type": "integer", "description": "Strike ID to update."},
+                "status": {"type": "string", "enum": ["Standby", "Engaged", "Neutralized", "Aborted", "Pending", "Template", "Undated"], "description": "Flat shortcut to update status."},
+                "assigned": {"type": "string", "enum": ["Adhipati", "Bhakta", "Antaryami", "Jigyasu"], "description": "Flat shortcut to update assigned Minister."},
+                "execution_date": {"type": "string", "description": "Flat shortcut to update execution date (DD-MM-YYYY)."},
+                "title": {"type": "string", "description": "Flat shortcut to update title."},
+                "notes": {"type": "string", "description": "Flat shortcut to update notes in short Markdown-Lite."},
                 "fields": {
                     "type": "object",
-                    "description": "Attributes to update.",
+                    "description": "Optional key-value dictionary of attributes to update.",
                     "properties": {
                         "status": {"type": "string", "enum": ["Standby", "Engaged", "Neutralized", "Aborted", "Pending", "Template", "Undated"]},
                         "assigned": {"type": "string", "enum": ["Adhipati", "Bhakta", "Antaryami", "Jigyasu"]},
                         "execution_date": {"type": "string"},
                         "title": {"type": "string"},
-                        "notes": {"type": "string"},
+                        "notes": {"type": "string", "description": "Tactical runbook notes in clean Markdown-Lite format (- bullets, 1. steps). Keep short, simple, and clutter-free."},
                         "reschedule_count": {"type": "integer"},
                         "task_id": {"type": "integer"},
                         "subtask_id": {"type": "integer"}
                     }
                 }
             },
-            "required": ["strike_id", "fields"]
+            "required": ["strike_id"]
         }
     },
     {
@@ -1856,12 +2138,13 @@ TOOLS = [
     },
     {
         "name": "campaigns_list_treasury",
-        "description": "Query and filter financial obligations: filter by flow_type (Payable/Receivable), state (Open/Closed/Cancelled), category, counterparty_id, or search string.",
+        "description": "Query and filter financial obligations: filter by flow_type (Payable/Receivable), state (Open/Closed), status (In Progress, Partially Paid, Pending, Disputed, Paid, Settled, Defaulted), category, counterparty_id, or search string.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "flow_type": {"type": "string", "enum": ["Payable", "Receivable"], "description": "Flow direction."},
-                "state": {"type": "string", "enum": ["Open", "Closed", "Cancelled"], "description": "Financial state."},
+                "state": {"type": "string", "enum": ["Open", "Closed"], "description": "Financial state (Open, Closed)."},
+                "status": {"type": "string", "enum": ["In Progress", "Partially Paid", "Pending", "Disputed", "Paid", "Settled", "Defaulted"], "description": "Financial status."},
                 "category": {"type": "string", "description": "Obligation category."},
                 "counterparty_id": {"type": "integer", "description": "Filter by counterparty record ID."},
                 "search": {"type": "string", "description": "Search keyword in title, notes, or counterparty name."},
@@ -1871,7 +2154,7 @@ TOOLS = [
     },
     {
         "name": "campaigns_manage_treasury",
-        "description": "Create, update, record payment (partial or full), or delete treasury obligations with strict 4-pillar relational schema enforcement.",
+        "description": "Create, update, record payment (partial or full), or delete treasury obligations with strict 4-pillar relational schema enforcement and flat shortcut support.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1885,18 +2168,25 @@ TOOLS = [
                 "amount": {"type": "number", "description": "Total principal amount in INR."},
                 "paid_amount": {"type": "number", "default": 0.0, "description": "Paid amount so far."},
                 "priority": {"type": "string", "enum": ["High", "Medium", "Low"], "default": "Medium"},
-                "state": {"type": "string", "enum": ["Open", "Closed", "Cancelled"], "default": "Open"},
+                "state": {"type": "string", "enum": ["Open", "Closed"], "default": "Open"},
+                "status": {"type": "string", "enum": ["In Progress", "Partially Paid", "Pending", "Disputed", "Paid", "Settled", "Defaulted"], "description": "Financial status under Open or Closed."},
                 "opened_at": {"type": "string", "description": "DD-MM-YYYY creation date."},
                 "opened_mode": {"type": "string", "enum": ["UPI", "Cash", "NetBanking", "Card", "Barter", "Other"], "default": "UPI"},
                 "opened_reference": {"type": "string", "description": "Txn ID / invoice number."},
-                "opened_note": {"type": "string", "description": "Inception context / terms."},
+                "opened_note": {"type": "string", "description": "Opening terms / context in clean Markdown-Lite. Keep short, simple, and clutter-free."},
                 "promise_date": {"type": "string", "description": "DD-MM-YYYY commitment date."},
                 "expected_date": {"type": "string", "description": "DD-MM-YYYY expected realization date."},
+                "closed_at": {"type": "string", "description": "DD-MM-YYYY final settlement date."},
+                "closed_mode": {"type": "string", "enum": ["UPI", "Cash", "NetBanking", "Card", "Barter", "Other"], "description": "Settlement payment mode."},
+                "closed_reference": {"type": "string", "description": "Settlement Txn ID / receipt reference."},
+                "closed_note": {"type": "string", "description": "Settlement log or write-off note in clean Markdown-Lite."},
                 "payment_amount": {"type": "number", "description": "Amount being paid now (for record_payment action)."},
                 "payment_mode": {"type": "string", "enum": ["UPI", "Cash", "NetBanking", "Card", "Barter", "Other"], "default": "UPI"},
                 "payment_reference": {"type": "string", "description": "Txn reference for this payment."},
-                "note": {"type": "string", "description": "Payment note."},
-                "fields": {"type": "object", "description": "Key-value dictionary of fields to update (for update action)."}
+                "note": {"type": "string", "description": "Installment payment note in clean Markdown-Lite. Keep short, simple, and clutter-free."},
+                "recurrence_id": {"type": "string", "description": "Optional recurring tag or series identifier."},
+                "campaign_id": {"type": "integer", "description": "Optional linked campaign task ID."},
+                "fields": {"type": "object", "description": "Key-value dictionary of fields to update (e.g. closed_note, opened_note). Format notes in short, simple Markdown-Lite."}
             },
             "required": ["action"]
         }
@@ -1908,7 +2198,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "search": {"type": "string", "description": "Search in counterparty name, contact, or comment."},
-                "activity": {"type": "string", "enum": ["Active", "Dormant", "Archived"], "description": "Filter by activity."},
+                "activity": {"type": "string", "enum": ["Active", "Dormant", "Banned", "Defaulted"], "description": "Filter by activity status."},
                 "relation": {"type": "string", "enum": ["Personal", "Friend", "Family", "Client", "Vendor", "Broker", "Bank", "Other"], "description": "Filter by relation."},
                 "limit": {"type": "integer", "default": 100}
             }
@@ -1935,9 +2225,9 @@ TOOLS = [
                 "counterparty_id": {"type": "integer", "description": "Counterparty ID (for update, delete)."},
                 "name": {"type": "string", "description": "Counterparty name (unique)."},
                 "relation": {"type": "string", "enum": ["Personal", "Friend", "Family", "Client", "Vendor", "Broker", "Bank", "Other"], "default": "Personal"},
-                "activity": {"type": "string", "enum": ["Active", "Dormant", "Archived"], "default": "Active"},
+                "activity": {"type": "string", "enum": ["Active", "Dormant", "Banned", "Defaulted"], "default": "Active"},
                 "contact": {"type": "string", "description": "Phone / email / UPI handle."},
-                "comment": {"type": "string", "description": "Context notes."},
+                "comment": {"type": "string", "description": "Context, operating terms, and bank/UPI details in clean Markdown-Lite. Keep short, simple, and clutter-free."},
                 "fields": {"type": "object", "description": "Key-value dictionary of fields to update."}
             },
             "required": ["action"]
@@ -1986,7 +2276,8 @@ def send_json(payload):
     sys.stdout.flush()
 
 def handle_jsonrpc(line):
-    if not line.strip():
+    line = line.strip().lstrip('\ufeff')
+    if not line:
         return
     try:
         req = json.loads(line)

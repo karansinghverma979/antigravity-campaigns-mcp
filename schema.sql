@@ -80,9 +80,10 @@ CREATE TABLE IF NOT EXISTS Tasks (
   reschedule_1          TEXT,                           -- Strict DD-MM-YYYY (1st rescheduled deadline snapshot)
   reschedule_2          TEXT,                           -- Strict DD-MM-YYYY (2nd rescheduled deadline snapshot)
   ended_date            TEXT,                           -- Strict DD-MM-YYYY (Stamped on Archive entry)
-  end_note              TEXT,                           -- Markdown-Lite: Multi-line victory report / post-mortem analysis
+  end_note              TEXT,                           -- Markdown-Lite: Multi-line victory report / post-mortem analysis (Keep short, clean, structured)
   days_spent            INTEGER,                        -- Total calendar days from origin to ended_date
-  is_breached_extracted INTEGER DEFAULT 0               -- Boolean: 0 | 1
+  is_breached_extracted INTEGER DEFAULT 0,              -- Boolean: 0 | 1
+  description           TEXT DEFAULT ""                 -- Markdown-Lite: Short, clean mission briefing / operational runbook (auto-seeds Obsidian manifest)
 );
 
 -- 4. SUBTASKS (Tactical Checkpoints)
